@@ -160,6 +160,7 @@ def test_feasible_guarantees_then_extra_by_priority(loaded):
     assert pipes["P2"]["used"] == pytest.approx(6)
     assert pipes["P5"]["conducting"] is False
     assert pipes["P5"]["used"] == pytest.approx(0)
+    _assert_attribution_consistency(data)
 
 
 def test_zero_guarantees_match_status_allocation(loaded):
@@ -279,11 +280,87 @@ def test_reroute_previous_flow_for_guarantee(client):
         src = _by_id(data["source_utilization"], "source_id")
         assert src["S1"]["used"] == pytest.approx(6)
         assert src["S2"]["used"] == pytest.approx(6)
-        by_all = alloc["D1"]["by_source"]
-        by_all.update(alloc["D2"]["by_source"])
-        assert sum(by_all.values()) == pytest.approx(12)
+
+        # —— 逐点水源归属（本轮修复点）——
+        # D2 仅可经 S1->D2(P4) 到达；S2 到 D2 无任何开启单向路径，
+        # 重排后最终有效流为 S2->J->D1 与 S1->D2：
+        assert alloc["D1"]["by_source"] == {"S2": 6.0}
+        assert alloc["D2"]["by_source"] == {"S1": 6.0}
+        # 旧实现误把“增广时的源边增量”记给当前点，会错成 D1<-S1、D2<-S2
+        assert "S1" not in alloc["D1"]["by_source"]
+        assert "S2" not in alloc["D2"]["by_source"]
+        _assert_attribution_consistency(data)
     finally:
         client.put("/api/network", json=valid_network())
+
+
+def test_by_source_credited_only_to_reachable_sources(client):
+    """by_source 中每个水源都必须沿开启的单向管段实际可达该用水点。"""
+    r = client.put("/api/network", json=reroute_network())
+    assert r.status_code == 200, r.text
+    rev = r.json()["revision"]
+    try:
+        r = client.post("/api/guarantee/preview", json={
+            "revision": rev,
+            "guarantees": guarantees(D1=6, D2=6),
+        })
+        data = r.json()
+        assert data["feasible"] is True
+        net = reroute_network()
+        can_reach = _directed_reachable_sources(net)
+        for a in data["allocations"]:
+            for sid in a["by_source"]:
+                assert sid in can_reach[a["demand_id"]], (
+                    a["demand_id"], sid, can_reach[a["demand_id"]]
+                )
+        # S2 只能到达 D1（经 J），到 D2 无单向路径
+        assert "S2" not in can_reach["D2"]
+        assert can_reach["D1"] == {"S1", "S2"}
+    finally:
+        client.put("/api/network", json=valid_network())
+
+
+def _directed_reachable_sources(net):
+    """按开启单向管段求每个用水点可由哪些水源到达（测试辅助）。"""
+    nodes = [n["id"] for n in net["sources"] + net["demands"] + net["junctions"]]
+    adj = {nid: [] for nid in nodes}
+    valved = {v["pipe_id"] for v in net["valves"]}
+    open_pipes = {v["pipe_id"] for v in net["valves"] if v["is_open"]}
+    for p in net["pipes"]:
+        # 挂有阀门的管段须有开启阀门才导通；无阀门视为导通
+        if p["id"] not in valved or p["id"] in open_pipes:
+            adj[p["from_node"]].append(p["to_node"])
+    reach = {}
+    for d in net["demands"]:
+        ok = set()
+        for s in net["sources"]:
+            seen, q = {s["id"]}, [s["id"]]
+            while q:
+                u = q.pop(0)
+                if u == d["id"]:
+                    ok.add(s["id"])
+                    break
+                for v in adj.get(u, []):
+                    if v not in seen:
+                        seen.add(v)
+                        q.append(v)
+        reach[d["id"]] = ok
+    return reach
+
+
+def _assert_attribution_consistency(data):
+    """通用不变量：来源之和=supplied；水源跨点合计=used；均为非负有限值。"""
+    src_used = {s["source_id"]: s["used"]
+                for s in data["source_utilization"]}
+    cross = {sid: 0.0 for sid in src_used}
+    for a in data["allocations"]:
+        row_sum = round(sum(a["by_source"].values()), 9)
+        assert row_sum == a["supplied"], (a["demand_id"], row_sum, a["supplied"])
+        for sid, v in a["by_source"].items():
+            assert v >= 0
+            cross[sid] = round(cross.get(sid, 0.0) + v, 9)
+    for sid, used in src_used.items():
+        assert cross.get(sid, 0.0) == used, (sid, cross.get(sid), used)
 
 
 def test_closed_valve_makes_guarantee_infeasible(loaded):
@@ -476,3 +553,125 @@ def test_preview_does_not_mutate_state(loaded):
     assert after_net["network"] == before_net["network"]
     assert after_status["allocations"] == before_status["allocations"]
     assert after_status["revision"] == rev
+
+
+# --------------------------------------------------------------------------- #
+# 随机网络性质测试：归属守恒（行/列）、非负、来源实际可达（逐点）
+# --------------------------------------------------------------------------- #
+def _random_layered_network(rng):
+    """生成“水源层 -> 连接点层 -> 用水点层（允许水源直连）”的有向无环网。"""
+    n_src = rng.randint(1, 3)
+    n_j = rng.randint(0, 3)
+    n_d = rng.randint(1, 3)
+    sources = [{"id": f"S{i}", "capacity": rng.randint(0, 12)} for i in range(n_src)]
+    demands = [
+        {"id": f"D{i}", "demand": rng.randint(0, 10), "priority": rng.randint(0, 5)}
+        for i in range(n_d)
+    ]
+    junctions = [{"id": f"J{i}"} for i in range(n_j)]
+    pipes, valves, pid = [], [], [0]
+
+    def add_pipe(a, b):
+        pid[0] += 1
+        pidv = f"P{pid[0]}"
+        pipes.append({"id": pidv, "from_node": a, "to_node": b,
+                      "capacity": rng.randint(0, 10)})
+        if rng.random() < 0.4:
+            vid = f"V{pid[0]}"
+            valves.append({"id": vid, "pipe_id": pidv,
+                           "is_open": rng.random() < 0.8})
+
+    for s in sources:
+        if n_j and rng.random() < 0.8:
+            add_pipe(s["id"], f"J{rng.randrange(n_j)}")
+        if rng.random() < 0.5 and n_d:  # 水源直连用水点
+            add_pipe(s["id"], f"D{rng.randrange(n_d)}")
+    for j in junctions:
+        for d in demands:
+            if rng.random() < 0.5:
+                add_pipe(j["id"], d["id"])
+        for j2 in junctions:  # 连接点之间也可串接（仍无环的方向 J_i -> J_k 随机）
+            if j2["id"] != j["id"] and rng.random() < 0.2:
+                add_pipe(j["id"], j2["id"])
+    return {
+        "sources": sources, "demands": demands, "junctions": junctions,
+        "pipes": pipes, "valves": valves, "forbidden_pairs": [],
+    }
+
+
+def test_random_networks_attribution_invariants():
+    """200 个随机网络：归属行和=supplied、列和=used、来源沿开启单向管段可达。"""
+    import random
+    from app.engine import build_network
+    from app import guarantee as gsvc
+
+    rng = random.Random(20261007)
+    checked = 0
+    for _ in range(200):
+        net = _random_layered_network(rng)
+        network, errs = build_network(net)
+        if errs:
+            continue
+        # 保障量取每点需求的 [0,1] 倍，保证不超需求
+        items = []
+        for d in net["demands"]:
+            frac = rng.choice([0.0, 0.25, 0.5, 1.0])
+            items.append({"demand_id": d["id"], "amount": d["demand"] * frac})
+        res = gsvc.preview(network, 1, items)
+        if not res["feasible"]:
+            assert "allocations" not in res
+            continue
+        checked += 1
+        reach = _directed_reachable_sources(net)
+        used = {s["source_id"]: s["used"] for s in res["source_utilization"]}
+        cross = {sid: 0.0 for sid in used}
+        for a in res["allocations"]:
+            assert round(sum(a["by_source"].values()), 9) == a["supplied"]
+            for sid, v in a["by_source"].items():
+                assert v >= 0
+                assert sid in reach[a["demand_id"]]
+                cross[sid] = round(cross[sid] + v, 9)
+        for sid, u in used.items():
+            assert cross[sid] == u
+    assert checked > 50  # 确保确实覆盖到足量可行网络
+
+
+def test_fractional_capacities_attribution_reconciles(client):
+    """小数容量/需求下，归属仍逐点、逐水源精确对账（覆盖 9 位舍入对账路径）。"""
+    net = {
+        "sources": [
+            {"id": "S1", "capacity": 3.5},
+            {"id": "S2", "capacity": 3.25},
+        ],
+        "demands": [
+            {"id": "D1", "demand": 3.0, "priority": 9},
+            {"id": "D2", "demand": 3.75, "priority": 1},
+        ],
+        "junctions": [{"id": "J"}],
+        "pipes": [
+            {"id": "P1", "from_node": "S1", "to_node": "J", "capacity": 3.5},
+            {"id": "P2", "from_node": "S2", "to_node": "J", "capacity": 3.25},
+            {"id": "P3", "from_node": "J", "to_node": "D1", "capacity": 3.5},
+            {"id": "P4", "from_node": "S1", "to_node": "D2", "capacity": 3.5},
+        ],
+        "valves": [],
+        "forbidden_pairs": [],
+    }
+    r = client.put("/api/network", json=net)
+    assert r.status_code == 200, r.text
+    rev = r.json()["revision"]
+    try:
+        r = client.post("/api/guarantee/preview", json={
+            "revision": rev,
+            "guarantees": guarantees(D1=3.0, D2=3.0),
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["feasible"] is True
+        _assert_attribution_consistency(data)
+        # D2 的直连来源只有 S1；S2 只能经 J 到 D1，绝不能出现在 D2 的来源里
+        alloc = _by_id(data["allocations"])
+        assert "S2" not in alloc["D2"]["by_source"]
+        assert alloc["D1"]["by_source"].get("S2", 0.0) >= 0
+    finally:
+        client.put("/api/network", json=valid_network())

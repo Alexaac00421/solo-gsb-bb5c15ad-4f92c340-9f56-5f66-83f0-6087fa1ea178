@@ -13,7 +13,13 @@
    继续增广，允许经管段反向边**重排先前流量的路径**；汇边（用水点→超级汇）
    的反向边不在分层增广路径上，任何点的既有供水只增不减，
    单点总供水不超过其需求。
-4. 未知/错类设施、重复/缺失条目、保障量超需求一次性带定位 400 拒绝；
+4. **逐点水源归属**：增广过程中的源边增量无法直接归属到某个点（后期增广
+   会借反向边重排前期流量的路径），因此归属在全部增广结束后，对**最终有效
+   流量**做 s-t 路径分解：把每条“水源→…→用水点”的实际正向流记账给该
+   (水源, 用水点)；不触碰源/汇的环流只占用管段容量、不计入任何点的归属。
+   由此保证：各点 by_source 之和等于该点 supplied；各水源跨点合计等于
+   source_utilization.used；被记账的水源必然沿开启的单向管段实际可达该点。
+5. 未知/错类设施、重复/缺失条目、保障量超需求一次性带定位 400 拒绝；
    负数/非有限数由 Pydantic 层 422 拒绝；过期修订号 409 拒绝。
    任何失败都**不返回混合版本结果**；预演只读：不改变管网、阀位、
    复水计划或修订号。
@@ -118,6 +124,173 @@ def validate_guarantees(
     return guarantees, errors
 
 
+def _decompose_by_source(
+    dinic: Dinic,
+    super_source: int,
+    super_sink: int,
+    demand_ids: list[str],
+) -> dict[str, dict[str, float]]:
+    """把最终有效流量分解为“水源→…→用水点”路径并逐点归属（原始浮点值）。
+
+    Dinic 残边反向容量即该边的实际正向流。反复从超级源沿仍带正流的边走到
+    超级汇，抽出该路径上的瓶颈流量并记账；途中遇到环则先消环（环流不触碰
+    源/汇，不归属任何点）。流守恒保证只要源边还有正流就一定能走到汇。
+
+    返回 {demand_id: {source_id: amount}}。只沿带标签的正向边（水源边/
+    管段边/汇边）走，残量增广产生的反向边无标签、不参与，故每条被记账的
+    水源都沿开启的单向管段实际可达该用水点。
+    """
+    # node -> 流出该点且仍带正流的标签边（source/pipe/demand → sink）
+    out: dict[int, list[Any]] = {u: [] for u in range(dinic.n)}
+    for u in range(dinic.n):
+        for e in dinic.g[u]:
+            if e.tag is not None and dinic.g[e.to][e.rev].cap > EPS:
+                out[u].append(e)
+
+    by_source: dict[str, dict[str, float]] = {did: {} for did in demand_ids}
+
+    while True:
+        sid_edge = next(
+            (e for e in out[super_source]
+             if dinic.g[e.to][e.rev].cap > EPS),
+            None,
+        )
+        if sid_edge is None:
+            break  # 所有源边正流已分解完毕
+
+        node_path = [super_source]
+        edge_path: list[Any] = []
+        while node_path[-1] != super_sink:
+            u = node_path[-1]
+            chosen = next(
+                (e for e in out[u] if dinic.g[e.to][e.rev].cap > EPS), None
+            )
+            if chosen is None:
+                # 流守恒下不会发生；防御性退出，避免死循环
+                break
+            if chosen.to in node_path:
+                # 消去环：沿环各边扣减环上瓶颈流量，路径截断到环起点后重走
+                cyc_start = node_path.index(chosen.to)
+                cyc_edges = edge_path[cyc_start:] + [chosen]
+                cyc_f = min(dinic.g[e.to][e.rev].cap for e in cyc_edges)
+                for e in cyc_edges:
+                    dinic.g[e.to][e.rev].cap -= cyc_f
+                del node_path[cyc_start:]
+                del edge_path[cyc_start:]
+                continue
+            node_path.append(chosen.to)
+            edge_path.append(chosen)
+        else:
+            f = min(dinic.g[e.to][e.rev].cap for e in edge_path)
+            for e in edge_path:
+                dinic.g[e.to][e.rev].cap -= f
+            sid = edge_path[0].tag["id"]       # 超级源->水源 边
+            did = edge_path[-1].tag["id"]      # 用水点->超级汇 边
+            acc = by_source[did]
+            acc[sid] = acc.get(sid, 0.0) + f
+            continue
+        break  # 防御性分支：中途走不通则停止分解
+
+    return by_source
+
+
+def _settle_attribution(
+    by_source: dict[str, dict[str, float]],
+    row_ids: list[str],
+    col_ids: list[str],
+    row_totals: dict[str, float],
+    col_totals: dict[str, float],
+) -> dict[str, dict[str, float]]:
+    """把归属矩阵舍入到 9 位小数，并**精确**对齐行/列合计。
+
+    行合计=各点 supplied，列合计=各水源 used（均已独立做 9 位舍入）。
+
+    做法（只在已存在的“可达水源”归属格上调整，不新增格、不让格变负）：
+    1. 每个归属格独立四舍五入到 1e-9 整数单位 q_rc。每格相对真实值的偏差
+       ∈ (-0.5, 0.5] 单位，故每条行/列的初始残差 |该轴残差| ≤ 该轴格子数；
+    2. 交替扫描行、列：某轴欠缺（残差 >0）时把缺口加到该轴现值最大的已有格；
+       富余（残差 <0）时从最大格起逐格扣到 0 为止。每次修正都把该轴残差清零，
+       新残差只会出现在与之交叉的另一轴上，且其绝对值不超过被搬动的单位数；
+    3. 初始残差有界、每轮把单位从富余轴搬向欠缺轴，配合总量锚点（行、列目标
+       总量先对齐），交替扫描在有限步内同时归零；循环上限与末尾对账断言兜底。
+
+    输入由同一最终流分解而来、行/列总量相等且每点的水源支撑真实可达，可行
+    解必然存在；若出现未预期情形，末尾断言会显式报错而不返回对不上账的归属。
+    """
+    unit = 1e-9
+    target_row = {rid: int(round(row_totals[rid] / unit)) for rid in row_ids}
+    target_col = {cid: int(round(col_totals[cid] / unit)) for cid in col_ids}
+
+    # 行、列目标总量一致才能同时对齐；二者来自同一总流量，正常无差。
+    total_diff = sum(target_row.values()) - sum(target_col.values())
+    if total_diff and col_ids:
+        anchor = max(col_ids, key=lambda c: target_col[c])
+        target_col[anchor] += total_diff
+
+    val: dict[tuple[str, str], int] = {}
+    for rid in row_ids:
+        for cid, v in by_source.get(rid, {}).items():
+            iv = int(round(v / unit))
+            if iv:
+                val[(rid, cid)] = iv
+
+    def line_cells(k: str, by_row: bool) -> list[tuple[str, str]]:
+        return [
+            (r, c) for (r, c) in val
+            if (r == k if by_row else c == k)
+        ]
+
+    def fix_axis(by_row: bool) -> bool:
+        moved = False
+        ids = row_ids if by_row else col_ids
+        targets = target_row if by_row else target_col
+        for k in ids:
+            cells_k = line_cells(k, by_row)
+            diff = targets[k] - sum(val[x] for x in cells_k)
+            if diff == 0 or not cells_k:
+                continue
+            if diff > 0:
+                # 欠缺：把缺口加到该轴现值最大的已有格（保持该点水源集合不变）
+                x = max(cells_k, key=lambda z: val[z])
+                val[x] += diff
+            else:
+                # 富余：从最大格起逐格扣减，任何格不得变负
+                need = -diff
+                for x in sorted(cells_k, key=lambda z: -val[z]):
+                    take = min(need, val[x])
+                    if take:
+                        val[x] -= take
+                        need -= take
+                    if need == 0:
+                        break
+            moved = True
+        return moved
+
+    # 初始总残差有界；交替扫描在该界内归零。上限取一个宽松上界兜底。
+    n_cells = max(1, len(val))
+    for _ in range(4 * n_cells + 4 * (len(row_ids) + len(col_ids)) + 100):
+        r_moved = fix_axis(True)
+        c_moved = fix_axis(False)
+        if not r_moved and not c_moved:
+            break
+
+    # 防御性自检：行/列合计必须与 supplied/used 精确一致（9 位单位）。
+    # 输入由同一最终流分解而来、支撑真实可达，理论上恒成立；若触发说明
+    # 出现未预期的舍入情形，宁可显式报错也不返回对不上账的归属。
+    for rid in row_ids:
+        assert sum(iv for (r, _c), iv in val.items() if r == rid) \
+            == target_row[rid], ("attribution row", rid)
+    for cid in col_ids:
+        assert sum(iv for (_r, c), iv in val.items() if c == cid) \
+            == target_col[cid], ("attribution col", cid)
+
+    out: dict[str, dict[str, float]] = {rid: {} for rid in row_ids}
+    for (rid, cid), iv in val.items():
+        if iv > 0:
+            out[rid][cid] = round(iv * unit, 9)
+    return out
+
+
 def preview(
     network: Network,
     revision: int,
@@ -136,8 +309,9 @@ def preview(
     )
 
     # 流网络：超级源 -> 水源（上限）-> 单向导通管段（容量）-> 用水点 -> 超级汇。
-    # 汇边初始容量 0：保障量与额外供水都通过“提额 + 残余增广”逐点汇入，
-    # 使每点的 by_source 可按增广归属精确记账（源边用量只增不减）。
+    # 汇边初始容量 0：保障量与额外供水都通过“提额 + 残余增广”逐点汇入；
+    # 后期增广会借管段反向边重排前期流量，故逐点水源归属不在增广时记账，
+    # 而是在全部增广结束后对最终有效流量做 s-t 路径分解（见 _decompose_by_source）。
     index = {nid: i for i, nid in enumerate(network.nodes)}
     super_source = len(index)
     super_sink = super_source + 1
@@ -170,8 +344,6 @@ def preview(
         demand_edges[node.id] = dinic.g[u][e_idx]
         demand_cap[node.id] = 0.0
 
-    by_source: dict[str, dict[str, float]] = {n.id: {} for n in demands}
-
     def augment_to(node: Any, target: float) -> float:
         """把该点汇边容量提升到 target 并在残余图上继续增广。
 
@@ -184,15 +356,7 @@ def preview(
         if add > EPS:
             edge.cap += add
             demand_cap[node.id] = target
-        before = {sid: e.cap for sid, e in source_edges.items()}
-        gained = dinic.max_flow(super_source, super_sink)
-        if gained > EPS:
-            for sid, e in source_edges.items():
-                delta = before[sid] - e.cap
-                if delta > EPS:
-                    acc = by_source[node.id]
-                    acc[sid] = round(acc.get(sid, 0.0) + delta, 9)
-        return gained
+        return dinic.max_flow(super_source, super_sink)
 
     def flow_of(did: str) -> float:
         return demand_cap[did] - demand_edges[did].cap
@@ -278,11 +442,45 @@ def preview(
     for node in demands:
         augment_to(node, node.demand or 0.0)
 
+    demand_id_order = [n.id for n in demands]
+    supplied_by_id: dict[str, float] = {
+        did: round(flow_of(did), 9) for did in demand_id_order
+    }
+
+    # 水源用量须在路径分解（会改写残边反向容量）之前从正向源边读取
+    used_by_source: dict[str, float] = {}
+    source_utilization = []
+    for sid in network.source_ids():
+        cap = network.nodes[sid].capacity or 0.0
+        e = source_edges.get(sid)
+        used = round(cap - e.cap, 9) if e is not None else 0.0
+        remaining = round(e.cap, 9) if e is not None else 0.0
+        used_by_source[sid] = used
+        source_utilization.append({
+            "source_id": sid,
+            "capacity": cap,
+            "used": used,
+            "remaining": remaining,
+        })
+
+    # 逐点水源归属：对最终有效流量做 s-t 路径分解，再把 9 位舍入残差对账到
+    # 行合计（各点 supplied）与列合计（各水源 used）
+    raw_by_source = _decompose_by_source(
+        dinic, super_source, super_sink, demand_id_order
+    )
+    by_source = _settle_attribution(
+        raw_by_source,
+        row_ids=demand_id_order,
+        col_ids=network.source_ids(),
+        row_totals=supplied_by_id,
+        col_totals=used_by_source,
+    )
+
     allocations: list[dict[str, Any]] = []
     for node in demands:
         need = node.demand or 0.0
         g = guarantees[node.id]
-        supplied = round(flow_of(node.id), 9)
+        supplied = supplied_by_id[node.id]
         allocations.append({
             "demand_id": node.id,
             "priority": node.priority or 0,
@@ -292,20 +490,9 @@ def preview(
             "extra": round(max(0.0, supplied - g), 9),
             "shortfall": round(max(0.0, need - supplied), 9),
             "fulfilled": supplied + EPS >= need,
-            "by_source": dict(by_source[node.id]),
+            "by_source": dict(sorted(by_source[node.id].items())),
         })
 
-    source_utilization = []
-    for sid in network.source_ids():
-        cap = network.nodes[sid].capacity or 0.0
-        e = source_edges.get(sid)
-        remaining = e.cap if e is not None else 0.0
-        source_utilization.append({
-            "source_id": sid,
-            "capacity": cap,
-            "used": round(cap - remaining, 9),
-            "remaining": round(remaining, 9),
-        })
     pipe_utilization = []
     for pid, pipe in sorted(network.pipes.items()):
         conducting = network.pipe_is_open(pipe)
