@@ -13,6 +13,12 @@
    继续增广，允许经管段反向边**重排先前流量的路径**；汇边（用水点→超级汇）
    的反向边不在分层增广路径上，任何点的既有供水只增不减，
    单点总供水不超过其需求。
+   **逐点水源归属按最终有效流量分解**：增广只负责求出最终流，阶段二结束后
+   把最终流沿“超级源→水源→开启的单向管段→用水点”分解为水源-用水点路径
+   （先消去有向环流再逐条取路径），按路径流量累计各点 by_source——
+   增广过程中为满足后续点而经反向边重排路径时，归属随之落在最终实际供水的
+   水源上；因此各点来源之和等于 supplied、各水源跨点合计等于
+   source_utilization.used，且每条来源都沿开启的单向管段实际可达。
 4. 未知/错类设施、重复/缺失条目、保障量超需求一次性带定位 400 拒绝；
    负数/非有限数由 Pydantic 层 422 拒绝；过期修订号 409 拒绝。
    任何失败都**不返回混合版本结果**；预演只读：不改变管网、阀位、
@@ -20,6 +26,7 @@
 """
 from __future__ import annotations
 
+import sys
 from typing import Any, Optional
 
 from .engine import EPS, Dinic, Network
@@ -118,6 +125,133 @@ def validate_guarantees(
     return guarantees, errors
 
 
+def _final_flow_by_source(
+    index: dict[str, int],
+    source_caps: dict[str, float],
+    source_edges: dict[str, Any],
+    pipe_defs: dict[str, tuple[str, str, float]],
+    pipe_edges: dict[str, Any],
+    demand_caps: dict[str, float],
+    demand_edges: dict[str, Any],
+) -> dict[str, dict[str, float]]:
+    """把最终有效流分解为 用水点 -> {水源: 流量}。
+
+    增广过程中后续点可能经管段反向边重排先前流量的路径，逐次增广的
+    “源边增量”并不等于最终各点的实际来源。这里以**最终流**为准：
+      1. 取源边/管段边/汇边的正向净流量（初始容量 − 残余容量）；
+      2. 先消去内部图（水源/连接点/用水点之间的导通单向管段边）中的有向环流；
+      3. 再把最终流拆成“水源 → … → 用水点 → 超级汇”的路径逐条记账。
+         汇边也是行走的可选出边，故水流**经某用水点继续流向下一用水点**时
+         不会被误记到途经点：每单位流只在其真正汇入的汇边终点记账。
+    分解只使用导通单向管段的正向边，因此记账的来源都沿开启的单向管段实际
+    可达；各点来源之和等于其汇边流量（supplied），各水源跨点合计等于源边
+    用量（source_utilization.used）。
+
+    pipe_defs: 管段id -> (from_node, to_node, 初始容量)，仅含流网络中的导通管段；
+    demand_caps: 用水点id -> 汇边初始容量（= 该点需求）。
+    """
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), len(index) * 4 + 1000))
+
+    n = len(index)
+    # 内部有向边（流量可变）：eid -> [u, v, flow]
+    edges: list[list[Any]] = []
+    adj: dict[int, list[int]] = {i: [] for i in range(n)}
+    for pid, e in pipe_edges.items():
+        a, b, cap0 = pipe_defs[pid]
+        flow = cap0 - e.cap
+        if flow > EPS:
+            adj[index[a]].append(len(edges))
+            edges.append([index[a], index[b], flow])
+
+    def find_cycle() -> Optional[list[int]]:
+        """在内部有向正流图中找一个环（边 id 序列）；无环返回 None。"""
+        color = [0] * n  # 0 白 / 1 灰（在递归栈上）/ 2 黑
+        stack_eids: list[int] = []
+
+        def dfs(u: int) -> Optional[list[int]]:
+            color[u] = 1
+            for eid in adj[u]:
+                if edges[eid][2] <= EPS:
+                    continue
+                v = edges[eid][1]
+                if color[v] == 0:
+                    stack_eids.append(eid)
+                    found = dfs(v)
+                    if found is not None:
+                        return found
+                    stack_eids.pop()
+                elif color[v] == 1:
+                    # 回边构成环：栈中从起点为 v 的边到末尾，加上当前回边
+                    cut = next(
+                        k for k, e in enumerate(stack_eids) if edges[e][0] == v
+                    )
+                    return stack_eids[cut:] + [eid]
+            color[u] = 2
+            return None
+
+        for s in range(n):
+            if color[s] == 0:
+                cyc = dfs(s)
+                if cyc is not None:
+                    return cyc
+        return None
+
+    # 消去全部有向环流：环流不经过任何汇边，不贡献任何点的实际供水
+    while True:
+        cyc = find_cycle()
+        if cyc is None:
+            break
+        f = min(edges[eid][2] for eid in cyc)
+        for eid in cyc:
+            edges[eid][2] -= f
+
+    node_of = {v: k for k, v in index.items()}
+    by_source: dict[str, dict[str, float]] = {did: {} for did in demand_edges}
+    # 各汇边尚存的净流量（行走选中汇边时按此扣减）
+    sink_remaining = {
+        did: demand_caps[did] - e.cap for did, e in demand_edges.items()
+    }
+
+    # 从每个水源出发，在无环正流图上反复取一条到超级汇的路径并扣除流量。
+    # 节点守恒保证：正流量要么沿管段继续，要么（在用水点）经汇边结束；
+    # 源出流量合计等于汇边流量合计，故全部水源 amount 取完时汇边也恰好用完。
+    for sid, e in source_edges.items():
+        amount = source_caps[sid] - e.cap
+        if amount <= EPS:
+            continue
+        u = index[sid]
+        while amount > EPS:
+            path_eids: list[int] = []
+            cur = u
+            end_did: Optional[str] = None
+            while True:
+                cur_id = node_of[cur]
+                # 到达用水点且其汇边尚有未记账流量：优先在此汇入超级汇；
+                # 汇边流量已取完时，则沿出边继续（该点只是水流途经点）。
+                if sink_remaining.get(cur_id, 0.0) > EPS:
+                    end_did = cur_id
+                    break
+                nxts = [eid for eid in adj[cur] if edges[eid][2] > EPS]
+                # 守恒保证：未到汇点的正流量节点必有正流量出边
+                eid = nxts[0]
+                path_eids.append(eid)
+                cur = edges[eid][1]
+            f = min([amount, sink_remaining[end_did]]
+                    + [edges[eid][2] for eid in path_eids])
+            for eid in path_eids:
+                edges[eid][2] -= f
+            sink_remaining[end_did] -= f
+            amount -= f
+            acc = by_source[end_did]
+            acc[sid] = acc.get(sid, 0.0) + f
+
+    # 与输出同口径四舍五入到 9 位小数，并丢弃归零项
+    return {
+        did: {s: round(v, 9) for s, v in acc.items() if round(v, 9) > 0}
+        for did, acc in by_source.items()
+    }
+
+
 def preview(
     network: Network,
     revision: int,
@@ -136,13 +270,15 @@ def preview(
     )
 
     # 流网络：超级源 -> 水源（上限）-> 单向导通管段（容量）-> 用水点 -> 超级汇。
-    # 汇边初始容量 0：保障量与额外供水都通过“提额 + 残余增广”逐点汇入，
-    # 使每点的 by_source 可按增广归属精确记账（源边用量只增不减）。
+    # 汇边初始容量 0：保障量与额外供水都通过“提额 + 残余增广”逐点汇入；
+    # 逐点 by_source 不按逐次增广增量记账（增广可能经反向边重排先前路径），
+    # 而是在最终流上统一分解（见 _final_flow_by_source）。
     index = {nid: i for i, nid in enumerate(network.nodes)}
     super_source = len(index)
     super_sink = super_source + 1
     dinic = Dinic(super_sink + 1)
 
+    source_caps: dict[str, float] = {}
     source_edges: dict[str, Any] = {}
     for sid in network.source_ids():
         cap = network.nodes[sid].capacity or 0.0
@@ -151,7 +287,9 @@ def preview(
             dinic.add_edge(
                 super_source, index[sid], cap, {"kind": "source", "id": sid}
             )
+            source_caps[sid] = cap
             source_edges[sid] = dinic.g[super_source][e_idx]
+    pipe_defs: dict[str, tuple[str, str, float]] = {}
     pipe_edges: dict[str, Any] = {}
     for pid, pipe in network.pipes.items():
         if network.pipe_is_open(pipe) and pipe.capacity > EPS:
@@ -160,6 +298,7 @@ def preview(
             dinic.add_edge(
                 u, index[pipe.to_node], pipe.capacity, {"kind": "pipe", "id": pid}
             )
+            pipe_defs[pid] = (pipe.from_node, pipe.to_node, pipe.capacity)
             pipe_edges[pid] = dinic.g[u][e_idx]
     demand_edges: dict[str, Any] = {}
     demand_cap: dict[str, float] = {}
@@ -169,8 +308,6 @@ def preview(
         dinic.add_edge(u, super_sink, 0.0, {"kind": "demand", "id": node.id})
         demand_edges[node.id] = dinic.g[u][e_idx]
         demand_cap[node.id] = 0.0
-
-    by_source: dict[str, dict[str, float]] = {n.id: {} for n in demands}
 
     def augment_to(node: Any, target: float) -> float:
         """把该点汇边容量提升到 target 并在残余图上继续增广。
@@ -184,15 +321,7 @@ def preview(
         if add > EPS:
             edge.cap += add
             demand_cap[node.id] = target
-        before = {sid: e.cap for sid, e in source_edges.items()}
-        gained = dinic.max_flow(super_source, super_sink)
-        if gained > EPS:
-            for sid, e in source_edges.items():
-                delta = before[sid] - e.cap
-                if delta > EPS:
-                    acc = by_source[node.id]
-                    acc[sid] = round(acc.get(sid, 0.0) + delta, 9)
-        return gained
+        return dinic.max_flow(super_source, super_sink)
 
     def flow_of(did: str) -> float:
         return demand_cap[did] - demand_edges[did].cap
@@ -278,6 +407,13 @@ def preview(
     for node in demands:
         augment_to(node, node.demand or 0.0)
 
+    # 逐点水源归属：按**最终有效流**沿开启的单向管段分解，
+    # 而非逐次增广的源边增量（后者在反向边重排路径后会错配归属）。
+    by_source = _final_flow_by_source(
+        index, source_caps, source_edges, pipe_defs, pipe_edges,
+        demand_cap, demand_edges,
+    )
+
     allocations: list[dict[str, Any]] = []
     for node in demands:
         need = node.demand or 0.0
@@ -292,7 +428,7 @@ def preview(
             "extra": round(max(0.0, supplied - g), 9),
             "shortfall": round(max(0.0, need - supplied), 9),
             "fulfilled": supplied + EPS >= need,
-            "by_source": dict(by_source[node.id]),
+            "by_source": dict(sorted(by_source.get(node.id, {}).items())),
         })
 
     source_utilization = []

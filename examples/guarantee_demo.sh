@@ -110,5 +110,40 @@ curl -sS -X POST "$BASE/api/valves/change" \
 echo "(V3 已恢复开启)"
 
 echo
-echo "== 7. 确认预演不写入：管网与修订号均未被本轮预演改变 =="
+echo "== 7. 逐点水源归属（重排）：S1/S2 各 6，S1→J、S2→J、J→D1、S1→D2 均 6 导通 =="
+echo "   D1、D2 需求与保障量均 6；D2 仅由 S1 可达，最终应为 D1 来自 S2、D2 来自 S1"
+curl -sS -X PUT "$BASE/api/network" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "sources":  [{"id": "S1", "capacity": 6}, {"id": "S2", "capacity": 6}],
+        "demands":  [{"id": "D1", "demand": 6, "priority": 9},
+                     {"id": "D2", "demand": 6, "priority": 1}],
+        "junctions": [{"id": "J"}],
+        "pipes": [
+          {"id": "P1", "from_node": "S1", "to_node": "J",  "capacity": 6},
+          {"id": "P2", "from_node": "S2", "to_node": "J",  "capacity": 6},
+          {"id": "P3", "from_node": "J",  "to_node": "D1", "capacity": 6},
+          {"id": "P4", "from_node": "S1", "to_node": "D2", "capacity": 6}
+        ],
+        "valves": [], "forbidden_pairs": []
+      }' > /tmp/guarantee_load.json
+REROUTE_REV="$(get_field /tmp/guarantee_load.json revision)"
+curl -sS -X POST "$BASE/api/guarantee/preview" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"revision\": $REROUTE_REV,
+        \"guarantees\": [
+          {\"demand_id\": \"D1\", \"amount\": 6},
+          {\"demand_id\": \"D2\", \"amount\": 6}
+        ]
+      }" | pp
+echo "   期望：D1.by_source = {\"S2\": 6}，D2.by_source = {\"S1\": 6}"
+# 恢复示例管网，便于重复演示
+curl -sS -X PUT "$BASE/api/network" \
+  -H 'Content-Type: application/json' \
+  --data @"$(dirname "$0")/sample_network.json" > /dev/null
+echo "(已恢复示例管网)"
+
+echo
+echo "== 8. 确认预演不写入：管网与修订号均未被本轮预演改变 =="
 curl -sS "$BASE/api/network" | pp

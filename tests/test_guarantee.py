@@ -286,6 +286,134 @@ def test_reroute_previous_flow_for_guarantee(client):
         client.put("/api/network", json=valid_network())
 
 
+def test_reroute_by_source_follows_final_flow(client):
+    """逐点水源归属按最终有效流量：重排后 D1 来自 S2、D2 来自 S1。
+
+    拓扑：S1、S2 上限均 6；S1→J、S2→J、J→D1、S1→D2 容量均 6 且导通；
+    D1、D2 需求与保障量均 6。D1 高优先级先取流时占 S1，但 D2 仅由 S1
+    可达，最终流把 D1 重排到 S2。若按逐次增广的源边增量记账，会误把
+    D1 记为 S1、D2 记为 S2。
+    """
+    r = client.put("/api/network", json=reroute_network())
+    assert r.status_code == 200, r.text
+    rev = r.json()["revision"]
+    try:
+        r = client.post("/api/guarantee/preview", json={
+            "revision": rev,
+            "guarantees": guarantees(D1=6, D2=6),
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        alloc = _by_id(data["allocations"])
+        # D2 仅由 S1 沿开启的单向管段可达；最终 D2 必来自 S1
+        assert alloc["D2"]["by_source"] == {"S1": 6.0}
+        # 重排后 D1 改由 S2 供水（S1 额度全部留给只靠它的 D2）
+        assert alloc["D1"]["by_source"] == {"S2": 6.0}
+        # 各点来源之和等于 supplied
+        for did in ("D1", "D2"):
+            assert sum(alloc[did]["by_source"].values()) == pytest.approx(
+                alloc[did]["supplied"]
+            )
+        # 各水源跨点合计等于 source_utilization.used
+        src = _by_id(data["source_utilization"], "source_id")
+        per_source: dict[str, float] = {}
+        for a in data["allocations"]:
+            for sid, v in a["by_source"].items():
+                per_source[sid] = per_source.get(sid, 0.0) + v
+        assert per_source["S1"] == pytest.approx(src["S1"]["used"])
+        assert per_source["S2"] == pytest.approx(src["S2"]["used"])
+    finally:
+        client.put("/api/network", json=valid_network())
+
+
+def test_by_source_invariants_hold_for_all_feasible_inputs(loaded):
+    """可行结果下恒有：来源和=supplied、跨点合计=used、来源沿开启单向管段可达。"""
+    client, rev = loaded
+
+    def reachable_sources(net_resp):
+        net = net_resp["network"]
+        ids = [n["id"] for n in
+               net["sources"] + net["demands"] + net["junctions"]]
+        adj: dict[str, list[str]] = {nid: [] for nid in ids}
+        valves_by_pipe: dict[str, list[bool]] = {}
+        for v in net["valves"]:
+            valves_by_pipe.setdefault(v["pipe_id"], []).append(v["is_open"])
+        for p in net["pipes"]:
+            states = valves_by_pipe.get(p["id"], [])
+            conducting = all(states) if states else True  # 未挂阀门视为常通
+            if conducting:
+                adj[p["from_node"]].append(p["to_node"])
+        reach = {}
+        for s in net["sources"]:
+            seen, stack = {s["id"]}, [s["id"]]
+            while stack:
+                u = stack.pop()
+                for v in adj.get(u, []):
+                    if v not in seen:
+                        seen.add(v)
+                        stack.append(v)
+            reach[s["id"]] = seen
+        return reach
+
+    net_resp = client.get("/api/network").json()
+    reach = reachable_sources(net_resp)
+    for gl in [(0, 0, 0), (4, 2, 1), (10, 4, 2), (10, 0, 0), (0, 4, 6)]:
+        r = client.post("/api/guarantee/preview", json={
+            "revision": rev,
+            "guarantees": guarantees(D1=gl[0], D2=gl[1], D3=gl[2]),
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        if not data["feasible"]:
+            continue
+        used = {s["source_id"]: s["used"]
+                for s in data["source_utilization"]}
+        per_source: dict[str, float] = {}
+        for a in data["allocations"]:
+            assert sum(a["by_source"].values()) == pytest.approx(a["supplied"])
+            for sid, v in a["by_source"].items():
+                assert a["demand_id"] in reach[sid]
+                per_source[sid] = per_source.get(sid, 0.0) + v
+        for sid, u in used.items():
+            assert per_source.get(sid, 0.0) == pytest.approx(u)
+
+
+def test_flow_passing_through_demand_attributed_to_sink(client):
+    """水流途经某用水点继续流向下一用水点时，归属只记在真正汇入的终点。
+
+    S1 -> D1 -> D2，D1 自身汇 3、同时有 5 个单位流经 D1 到 D2；
+    D1 的 by_source 只应记 3，D2 记 5，途经流量不得记到 D1。
+    """
+    net = {
+        "sources": [{"id": "S1", "capacity": 8}],
+        "demands": [
+            {"id": "D1", "demand": 3, "priority": 9},
+            {"id": "D2", "demand": 5, "priority": 1},
+        ],
+        "junctions": [],
+        "pipes": [
+            {"id": "P1", "from_node": "S1", "to_node": "D1", "capacity": 8},
+            {"id": "P2", "from_node": "D1", "to_node": "D2", "capacity": 8},
+        ],
+        "valves": [],
+        "forbidden_pairs": [],
+    }
+    r = client.put("/api/network", json=net)
+    assert r.status_code == 200, r.text
+    rev = r.json()["revision"]
+    try:
+        r = client.post("/api/guarantee/preview", json={
+            "revision": rev,
+            "guarantees": guarantees(D1=3, D2=5),
+        })
+        assert r.status_code == 200, r.text
+        alloc = _by_id(r.json()["allocations"])
+        assert alloc["D1"]["by_source"] == {"S1": 3.0}
+        assert alloc["D2"]["by_source"] == {"S1": 5.0}
+    finally:
+        client.put("/api/network", json=valid_network())
+
+
 def test_closed_valve_makes_guarantee_infeasible(loaded):
     """现有阀位直接作用于判定：V3 关闭后 D2 的保障不可达。"""
     client, rev = loaded
